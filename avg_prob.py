@@ -78,7 +78,7 @@ def get_dpm_probabilites_avg(market, time_window):
     tol = 1e-7 # tolerance for numerical tests
 
     # market should be open for longer than time_window
-    assert(close_time - time_window*3600 > market["createdTime"])
+    assert(close_time - time_window*1000 > market["createdTime"])
 
     probs = [0.0] + [x["probability"] for x in market["answers"]]
     probs[0] = 1.0 - sum(probs)
@@ -136,7 +136,7 @@ def get_binary_probability_avg(market, time_window):
     tol = 1e-7
 
     # market should be open for longer than time_window
-    assert(close_time - time_window*3600 > market["createdTime"])
+    assert(close_time - time_window*1000 > market["createdTime"])
 
     prob = market["probability"]
 
