@@ -25,6 +25,12 @@ def get_market_by_url(market_url):
     r = requests.get(API_ENDPOINT + "/slug/" + slug)
     return r.json()
 
+def get_market_by_id(market_id):
+    """ calls the api and gets the market data """
+
+    # call the api
+    r = requests.get(API_ENDPOINT + "/market/" + market_id)
+    return r.json()
 
 def print_market_info(market):
     """ given a market object (dict), print question, id, creatorUsername """
@@ -174,8 +180,15 @@ def calculate_mixed_outcomes(outcomes, prob_pick_three):
     Here, prob_pick_three is the probability that we pick 3 markets.
     """
 
+    if len(outcomes)==1:
+        outcome = outcomes[0]
+        return [((outcome[0],), 1.0)]
+
     # calculate probabilities for picking two outcomes
     paired_outcomes = calculate_paired_probs(outcomes)
+
+    if len(outcomes)==2:
+        return [((x[0],x[1]), x[2]) for x in paired_outcomes]
 
     # calculate probabilities for picking three outcomes
     triple_outcomes = calculate_triple_probs(outcomes)
@@ -252,6 +265,7 @@ def print_short_integer_range_outcomes(int_outcomes):
     dont_print_after = 90*1e7
     max_int = int_outcomes[-1][2]
 
+    print("\n" + "-"*20 + "\n")
     print("pick a number between 1 and {} (inclusive)".format(max_int))
 
     print("Outcomes by integer range:")
@@ -363,6 +377,207 @@ def probabilistic_rounding(x):
         return x_int
 
 
+# leverage:
+# - list of markets with parents and params
+# - dict: [market]
+#   - parent, params, moveNr, move(?), mkt_avg, 
+# - para
+
+def load_conditional_market_file():
+
+    filename = "data/cond_markets.json"
+    contents = open(filename).read()
+    # you have to init the file if it does not exist yet
+    return json.loads(contents)
+
+def save_conditional_market_file(data):
+
+    filename = "data/cond_markets.json"
+    contents = json.dumps(data, indent=2)
+    with open(filename, "w") as f:
+        f.write(contents)
+
+def find_best_mkt(mkts, mkt_data):
+    """ returns the market id with the best mkt_avg """
+    curr_best = mkts[0]
+    for x in mkts:
+        if mkt_data[x]["mkt_avg"] > mkt_data[curr_best]["mkt_avg"]:
+            curr_best = x
+    return curr_best
+
+def suggest_market_entry(market, mkt_data):
+    """ makes suggestions for an entry into the conditional markets file.
+    Returns True or False to indicate success/failure"""
+
+    market_id = market["id"]
+    assert( market_id not in mkt_data )
+    title = market["question"]
+
+    # try to extract move and move number
+    try:
+        number_str = title.split(".")[0].split(" ")[-1]
+        number = int(number_str)
+        move_str = title.split(". ")[1].split(",")[0]
+        move_str = number_str + ". " + move_str
+    except:
+        print("could not parse market title", title)
+        return False
+
+    mkt_avg = avg_prob.get_binary_probability_avg(market, time_window= 4* 3600)
+
+    if market["closeTime"] / 1000 > time.time():
+        # if market not yet closed
+        mkt_avg = None
+
+    # search for parent
+    poss_parent = []
+    for mkt in mkt_data:
+        if mkt_data[mkt]["moveNumber"] == number -1:
+            poss_parent.append(mkt)
+    if len(poss_parent)==0:
+        print("no parent candidates found for move", number)
+        return False
+    assert(len(poss_parent)<=3)
+    # parent is the one with best score
+    parent = find_best_mkt(poss_parent, mkt_data)
+
+    # params hard-coding
+    if number < 31:
+        params = [1.0, 0.5]
+    else:
+        center_mkt = mkt_data[parent]["mkt_avg"]
+        center_score = score(center_mkt, mkt_data[parent]["params"])
+        params = [5.0, round(center_score, 2)]
+
+    print("We suggest the following market data:")
+    print("moveNumber:", number)
+    print("move:", move_str)
+    print("params:", params)
+    print("market closing average value:", mkt_avg)
+    parent_move = mkt_data[parent]["move"]
+    print("parent market: move:", parent_move)
+    print("parent market: closing avg:", mkt_data[parent]["mkt_avg"])
+
+    yn = ask_yes_no("Do you accept this data?")
+    if not yn:
+        return False
+
+    mkt_data[market_id] = {"parent": parent,
+                           "params": params,
+                           "moveNumber": number,
+                           "move": move_str,
+                           "mkt_avg": mkt_avg}
+
+    save_conditional_market_file(mkt_data)
+    print("data saved")
+    return True
+
+
+def find_children(parent, mkt_data):
+    """ find all entries which have the right parent. """
+    return [x for x in mkt_data if mkt_data[x]["parent"]==parent]
+
+
+
+def score(mkt, param):
+    # converts market value to score when leverage is used
+
+    if param[0]==1.0:
+        return mkt
+
+    assert( 2.0 < param[0] <= 8.0)
+    tolerance = 0.1**8
+
+    leverage = param[0] # leverage near the center
+    center = param[1] # is score that corresponds to mkt 0.5
+
+    # interpolation point
+    low_mkt = 0.1
+    high_mkt = 0.9
+
+    if center + 0.5 / leverage + tolerance > 1.0 :
+        low_score = 1.0 - (1.0-low_mkt)/leverage
+        high_score = 1.0 - (1.0-high_mkt)/leverage
+    elif center - 0.5 / leverage < tolerance:
+        low_score = low_mkt / leverage
+        high_score = high_mkt / leverage
+    else: 
+        low_score = center - (0.5 - low_mkt) / leverage
+        high_score = center + (high_mkt - 0.5) / leverage
+
+    assert(high_score < 1.0)
+    assert(low_score > 0.0)
+    assert( 0.0 <= mkt <= 1.0)
+
+    # now do the interpolation
+    if mkt < low_mkt:
+        return mkt * low_score / low_mkt
+    elif mkt < high_mkt:
+        return low_score + (mkt - low_mkt)*(high_score-low_score) / (high_mkt - low_mkt)
+    else:
+        return 1.0 - (1.0 - mkt) * (1.0-high_score) / (1.0 - high_mkt)
+
+def mkt(score, param):
+    # inverse function of score()
+
+    if param[0]==1.0:
+        return score
+
+    assert( 2.0 < param[0] <= 8.0)
+    tolerance = 0.1**8
+
+    leverage = param[0] # leverage near the center
+    center = param[1] # is score that corresponds to mkt 0.5
+
+    # interpolation point
+    low_mkt = 0.1
+    high_mkt = 0.9
+
+    if center + 0.5 / leverage + tolerance > 1.0 :
+        low_score = 1.0 - (1.0-low_mkt)/leverage
+        high_score = 1.0 - (1.0-high_mkt)/leverage
+    elif center - 0.5 / leverage < tolerance:
+        low_score = low_mkt / leverage
+        high_score = high_mkt / leverage
+    else: 
+        low_score = center - (0.5 - low_mkt) / leverage
+        high_score = center + (high_mkt - 0.5) / leverage
+
+    assert(high_score < 1.0)
+    assert(low_score > 0.0)
+    assert( 0.0 <= score <= 1.0)
+
+    # now do the inverse interpolation
+    if score < low_score:
+        return score * low_mkt / low_score
+    elif score < high_score:
+        return low_mkt + (score - low_score)*(high_mkt-low_mkt) / (high_score - low_score)
+    else:
+        return 1.0 - (1.0 - score) * (1.0-high_mkt) / (1.0 - high_score)
+
+def print_mkt_score_table(param):
+    # Print a table of example (mkt, score) pairs using the score() and mkt() functions
+    # for interesting values of mkt
+
+    print("Here is a table of the correspondence to market value and score")
+    print('value  score')
+    print('-----  -----')
+
+    mkt_vals = [0.0, 0.03, 0.07, 0.1, 0.2, 0.3, 0.4]
+    mkt_vals += [0.5] + sorted([ 1-x for x in mkt_vals])
+
+    for mkt_val in mkt_vals:
+        score_val = score(mkt_val, param)
+        # mkt_val2 = mkt(score_val, param)
+        print(f'{mkt_val:.2f}   {score_val:.3f}')
+
+    print('----- -----')
+    score_val_lo = score(0.1, param)
+    score_val_hi = score(0.9, param)
+    def_str = "(0.0, 0.0), (0.1, %.2f), (0.9, %.2f), (1.0)" %(score_val_lo, score_val_hi)
+    print("This correspondence is defined by linearly interpolating between the points")
+    print(def_str + ".")
+
 
 def main_binary(market):
     """ main routine when it is a binary market """
@@ -370,12 +585,94 @@ def main_binary(market):
     p = avg_prob.get_binary_probability_avg(market, time_window= 4* 3600)
     print("")
     print("Average probability: {:.6f}".format(p))
+    mkt_data = load_conditional_market_file()
+    if market["id"] in mkt_data:
+        params = mkt_data[market["id"]]["params"]
+        my_score = score(p, params)
+        print("Score: {:.6f}".format(my_score))
     print("")
     more = ask_yes_no("more info")
-    if more:
-        prob_rounded_p = probabilistic_rounding(p)
-        print("probabilistic rounded: %d%%" %( prob_rounded_p))
+    if not more:
+        return
+    mkt_data = load_conditional_market_file()
+    if market["id"] not in mkt_data:
+        res = suggest_market_entry(market, mkt_data)
+        if not res:
+            return
+        time.sleep(0.5)
+        mkt_data = load_conditional_market_file()
 
+    # params = mkt_data[market["id"]]["params"]
+    parent = mkt_data[market["id"]]["parent"]
+    siblings = find_children(parent, mkt_data)
+    # print("siblings: ", [mkt_data[x]["move"] for x in siblings])
+    # siblings_all = ask_yes_no("are these conditional markets all markets in that move?")
+    # if not siblings_all:
+    #     return
+
+    # update market values
+    need_update = False
+    for s in siblings:
+        s_mkt = mkt_data[s]["mkt_avg"]
+
+        if s_mkt != None:
+            # no update needed
+            continue
+
+        s_api_data = get_market_by_id(s)
+        if s_api_data["closeTime"] / 1000 > time.time():
+            # if market not yet closed
+            print("not all market closed. sorry")
+            return
+        p = avg_prob.get_binary_probability_avg(s_api_data, time_window= 4* 3600)
+        need_update = True
+        mkt_data[s]["mkt_avg"] = p
+
+    if need_update:
+        save_conditional_market_file(mkt_data)
+
+    winner = find_best_mkt(siblings, mkt_data)
+
+    print("\n" + "="*30 + "\n")
+    for s in siblings:
+        s_mkt = mkt_data[s]["mkt_avg"]
+        assert(s_mkt != None)
+
+        s_score = score(s_mkt, mkt_data[s]["params"])
+
+        print(mkt_data[s]["move"] + ": Average market value: {:.6f}".format( s_mkt))
+        print(mkt_data[s]["move"] + ":                score: {:.6f}".format( s_score))
+
+    print("Winner:", mkt_data[winner]["move"])
+    winning_mkt = mkt_data[winner]["mkt_avg"]
+    winning_score = score(winning_mkt, mkt_data[winner]["params"])
+
+    if parent == None:
+        print("(no parent in system)")
+        return
+
+    # resolution of parent market
+
+    print("\n" + "-"*20 + "\n")
+
+    print("resolution of market", mkt_data[parent]["move"]+":")
+    parent_params = mkt_data[parent]["params"]
+    mkt_val = mkt(winning_score, parent_params)
+    print("resolution score: {:.6f}".format( winning_score))
+    print("corresponding market value: {:.6f}".format( mkt_val))
+    prob_rounded_p = probabilistic_rounding(mkt_val)
+    print("probabilistically rounded: %d%%" %( prob_rounded_p))
+
+    print("\n" + "="*30 + "\n")
+
+    next_move_number = mkt_data[winner]["moveNumber"] + 1
+    print("Table for move", str(next_move_number) +  ":")
+    if next_move_number < 31:
+        next_params = [1.0, round(winning_score, 2)]
+    else:
+        next_params = [5.0, round(winning_score, 2)]
+
+    print_mkt_score_table(next_params)
 
 
 def main_interactive():
